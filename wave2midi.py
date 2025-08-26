@@ -7,14 +7,15 @@ import sys
 import argparse
 import json
 import warnings
+import subprocess
+import shutil
+import tempfile
 from typing import List, Dict, Tuple, Optional
 import numpy as np
 import librosa
 import mido
 from mido import MidiFile, MidiTrack, Message
 import tensorflow as tf
-from spleeter.separator import Separator
-from spleeter.utils.audio.adapter import AudioAdapter
 from pathlib import Path
 
 class WaveToMIDIConverter:
@@ -23,12 +24,12 @@ class WaveToMIDIConverter:
     converting each stem to MIDI using pitch detection.
     """
     
-    def __init__(self, config_path: Optional[str] = None):
+    def __init__(self, config: Optional[Dict] = None):
         """
-        Initialize the converter with optional configuration file.
+        Initialize the converter with an optional configuration dictionary.
         
         Args:
-            config_path: Path to JSON configuration file
+            config: Dictionary with configuration parameters
         """
         # Default configuration
         self.config = {
@@ -49,17 +50,13 @@ class WaveToMIDIConverter:
                 "vocals": 5,    # Voice
                 "drums": 0,     # Acoustic Grand Piano (for percussion)
                 "bass": 33,     # Electric Bass (finger)
-                "piano": 1,     # Bright Acoustic Piano
-                "guitar": 25,   # Acoustic Guitar (steel)
                 "other": 40     # String Ensemble 1
             }
         }
         
         # Load configuration if provided
-        if config_path and os.path.exists(config_path):
-            with open(config_path, 'r') as f:
-                user_config = json.load(f)
-                self.config.update(user_config)
+        if config:
+            self.config.update(config)
         
         # Set stem model based on stem count
         if self.config["stem_count"] == 2:
@@ -69,20 +66,12 @@ class WaveToMIDIConverter:
         elif self.config["stem_count"] == 5:
             self.config["model_type"] = "spleeter:5stems"
         
-        # Initialize audio adapter
-        self.audio_adapter = AudioAdapter.default()
-        
-        # Initialize separator
-        try:
-            self.separator = Separator(self.config["model_type"])
-        except Exception as e:
-            print(f"Warning: Could not initialize Spleeter model: {e}")
-            print("Please make sure spleeter is installed: pip install spleeter")
-            self.separator = None
+        self.audio_adapter = None
+        self.separator = None
     
     def separate_stems(self, wav_path: str) -> Dict[str, np.ndarray]:
         """
-        Separate the input WAV file into stems.
+        Separate the input WAV file into stems using the demucs command-line tool.
         
         Args:
             wav_path: Path to input WAV file
@@ -90,54 +79,42 @@ class WaveToMIDIConverter:
         Returns:
             Dictionary with stem names as keys and audio data as values
         """
-        if self.separator is None:
-            raise RuntimeError("Separator not initialized. Please check Spleeter installation.")
-        
-        # Load audio
-        print(f"Loading audio file: {wav_path}")
-        try:
-            waveform, sample_rate = self.audio_adapter.load(
-                wav_path, 
-                sample_rate=self.config["sample_rate"]
-            )
-        except Exception as e:
-            raise RuntimeError(f"Could not load audio file {wav_path}: {e}")
-        
-        # Ensure mono or stereo (convert if needed)
-        if len(waveform.shape) > 1:
-            # Convert to mono by averaging channels if stereo
-            if waveform.shape[0] > 1:
-                waveform = np.mean(waveform, axis=0)
-            else:
-                waveform = waveform[0]
-        
-        # Perform separation
-        print(f"Separating into {self.config['stem_count']} stems...")
-        try:
-            prediction = self.separator.separate(waveform)
-        except Exception as e:
-            raise RuntimeError(f"Stem separation failed: {e}")
-        
-        # Map stems based on model type
-        stem_names = []
-        if self.config["model_type"] == "spleeter:2stems":
-            stem_names = ["vocals", "accompaniment"]
-        elif self.config["model_type"] == "spleeter:4stems":
-            stem_names = ["vocals", "drums", "bass", "other"]
-        elif self.config["model_type"] == "spleeter:5stems":
-            stem_names = ["vocals", "drums", "bass", "piano", "other"]
-        
-        # Extract audio data for each stem
-        stems = {}
-        for i, name in enumerate(stem_names):
-            # Get the audio data (ensure mono)
-            if len(prediction[name].shape) > 1:
-                stem_audio = np.mean(prediction[name], axis=1)
-            else:
-                stem_audio = prediction[name]
-            stems[name] = stem_audio
-        
-        return stems
+        if not shutil.which('demucs'):
+            raise RuntimeError("demucs command not found. Please make sure it is installed and in your PATH.")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Note: demucs requires the input path to be absolute if cwd is changed.
+            absolute_wav_path = str(Path(wav_path).absolute())
+            cmd = ['demucs', absolute_wav_path]
+
+            print(f"Running demucs on {wav_path}...")
+            try:
+                # Run demucs with the CWD set to the temporary directory
+                subprocess.run(cmd, check=True, cwd=temp_dir, capture_output=True, text=True)
+            except subprocess.CalledProcessError as e:
+                raise RuntimeError(f"Demucs failed with error: {e.stderr}")
+
+            # Now, read the stems from the output directory inside the temp dir
+            stems = {}
+            stem_names = ['vocals', 'drums', 'bass', 'other']
+
+            # Default output path structure is separated/<model_name>/<track_name>
+            track_name = Path(wav_path).stem
+            model_name = 'htdemucs'  # This is the default model for demucs v4
+
+            output_base = Path(temp_dir) / 'separated' / model_name / track_name
+
+            if not output_base.exists():
+                raise RuntimeError(f"Demucs did not produce the expected output directory: {output_base}")
+
+            for stem_name in stem_names:
+                stem_path = output_base / f"{stem_name}.wav"
+                if stem_path.exists():
+                    print(f"Loading {stem_name} stem...")
+                    audio, sr = librosa.load(str(stem_path), sr=self.config['sample_rate'], mono=True)
+                    stems[stem_name] = audio
+
+            return stems
     
     def detect_notes(self, audio: np.ndarray, sample_rate: int) -> List[Dict]:
         """
@@ -241,7 +218,8 @@ class WaveToMIDIConverter:
         midi.tracks.append(track)
         
         # Set tempo
-        track.append(mido.MetaMessage('set_tempo', tempo=mido.bpm2tempo(tempo)))
+        microseconds_per_beat = mido.bpm2tempo(tempo)
+        track.append(mido.MetaMessage('set_tempo', tempo=microseconds_per_beat))
         
         # Program change based on instrument
         program = self.config["instrument_mapping"].get(instrument, 0)
@@ -256,17 +234,17 @@ class WaveToMIDIConverter:
         # Create note on/off messages
         for note in notes:
             # Calculate ticks for start time
-            start_tick = int(mido.time_to_ticks(
-                note['start_time'], 
-                midi.ticks_per_beat, 
-                midi.meta_track[0].tempo
+            start_tick = int(mido.second2tick(
+                note['start_time'],
+                midi.ticks_per_beat,
+                microseconds_per_beat
             ))
-            
+
             # Calculate ticks for duration
-            duration_tick = int(mido.time_to_ticks(
-                note['duration'], 
-                midi.ticks_per_beat, 
-                midi.meta_track[0].tempo
+            duration_tick = int(mido.second2tick(
+                note['duration'],
+                midi.ticks_per_beat,
+                microseconds_per_beat
             ))
             
             # Add wait time if needed
@@ -342,52 +320,43 @@ def main():
     parser.add_argument("input_wav", help="Input WAV file path")
     parser.add_argument("output_dir", help="Output directory for MIDI files")
     parser.add_argument(
-        "--stems", 
-        type=int, 
-        choices=[2, 4, 5], 
-        default=5,
-        help="Number of stems to separate (2, 4, or 5)"
-    )
-    parser.add_argument(
-        "--config", 
+        "--config",
         help="Path to JSON configuration file"
     )
     parser.add_argument(
-        "--bpm", 
-        type=int, 
-        default=120,
-        help="Output tempo in BPM"
+        "--bpm",
+        type=int,
+        help="Output tempo in BPM. Overrides config file."
     )
-    
+
     args = parser.parse_args()
-    
+
+    # Build configuration
+    config = {}
+    if args.config:
+        try:
+            with open(args.config, 'r') as f:
+                config = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            print(f"Warning: Could not load config file {args.config}: {e}", file=sys.stderr)
+
+    # Override config with command-line arguments
+    if args.bpm is not None:
+        config['output_bpm'] = args.bpm
+
     try:
-        # Create converter
-        converter = WaveToMIDIConverter(args.config)
-        
-        # Update stem count if specified
-        if args.stems:
-            converter.config["stem_count"] = args.stems
-            if args.stems == 2:
-                converter.config["model_type"] = "spleeter:2stems"
-            elif args.stems == 4:
-                converter.config["model_type"] = "spleeter:4stems"
-            elif args.stems == 5:
-                converter.config["model_type"] = "spleeter:5stems"
-        
-        # Update BPM if specified
-        if args.bpm:
-            converter.config["output_bpm"] = args.bpm
-        
+        # Create converter with the final configuration
+        converter = WaveToMIDIConverter(config)
+
         # Perform conversion
         print(f"Converting {args.input_wav} to MIDI...")
         midi_files = converter.convert(args.input_wav, args.output_dir)
-        
+
         print(f"\nConversion complete!")
         print(f"Created {len(midi_files)} MIDI files:")
         for midi_file in midi_files:
             print(f"  {midi_file}")
-            
+
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
