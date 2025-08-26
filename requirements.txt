@@ -1,0 +1,2 @@
+# For development, install the package in editable mode with test dependencies
+-e .[test]
